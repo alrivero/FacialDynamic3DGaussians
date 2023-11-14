@@ -9,7 +9,9 @@ from tqdm import tqdm
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
-from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
+from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer, cat_params_to_optimizer
+from flame.flame import FlameHead
+import debug
 
 
 def get_dataset(t, md, seq):
@@ -34,7 +36,7 @@ def get_batch(todo_dataset, dataset):
     return curr_data
 
 
-def initialize_params(seq, md):
+def initialize_params(seq, md, include_flame=True):
     init_pt_cld = np.load(f"./data/{seq}/init_pt_cld.npz")["data"]
     seg = init_pt_cld[:, 6]
     max_cams = 50
@@ -58,10 +60,32 @@ def initialize_params(seq, md):
                  'scene_radius': scene_radius,
                  'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
                  'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+    
+    if include_flame:
+        # All flame params
+        params['flame_rotation'] = torch.nn.Parameter(torch.zeros((3)).cuda().float().contiguous())
+        params['flame_translation'] = torch.nn.Parameter(torch.zeros((3)).cuda().float().contiguous())
+        params['flame_scale'] = torch.nn.Parameter(torch.zeros((1)).cuda().float().contiguous())
+        params['flame_neck_pose'] = torch.nn.Parameter(torch.zeros((3)).cuda().float().contiguous())
+        params['flame_jaw_pose'] = torch.nn.Parameter(torch.zeros((3)).cuda().float().contiguous())
+        params['flame_eyes_pose'] = torch.nn.Parameter(torch.zeros((6)).cuda().float().contiguous())
+        params['flame_shape'] = torch.nn.Parameter(torch.zeros((300)).cuda().float().contiguous())
+        params['flame_expr'] = torch.nn.Parameter(torch.zeros((100)).cuda().float().contiguous())
+        params['flame_texture'] = torch.nn.Parameter(torch.zeros((100)).cuda().float().contiguous())
+        # Light exists but we're not rendering
+
+        # We don't optimize most of them
+        params['flame_neck_pose'].requires_grad = False
+        params['flame_jaw_pose'].requires_grad = False
+        params['flame_eyes_pose'].requires_grad = False
+        params['flame_shape'].requires_grad = False
+        params['flame_expr'].requires_grad = False
+        params['flame_texture'].requires_grad = False
+
     return params, variables
 
 
-def initialize_optimizer(params, variables):
+def initialize_optimizer(params, variables, include_flame=True):
     lrs = {
         'means3D': 0.00016 * variables['scene_radius'],
         'rgb_colors': 0.0025,
@@ -72,7 +96,13 @@ def initialize_optimizer(params, variables):
         'cam_m': 1e-4,
         'cam_c': 1e-4,
     }
-    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
+    param_groups = [{'params': [params[name]], 'name': name, 'lr': lr} for name, lr in lrs.items()]
+
+    if include_flame:
+        param_groups.append({'params': [params["flame_rotation"]], 'name': "flame_rotation", 'lr': 0.001})
+        param_groups.append({'params': [params["flame_translation"]], 'name': "flame_translation", 'lr': 0.001})
+        param_groups.append({'params': [params["flame_scale"]], 'name': "flame_scale", 'lr': 0.001})
+
     return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
 
 
@@ -183,16 +213,73 @@ def report_progress(params, data, i, progress_bar, every_i=100):
         progress_bar.set_postfix({"train img 0 PSNR": f"{psnr:.{7}f}"})
         progress_bar.update(every_i)
 
+def get_flame_params(flame_data, t):
+    flame_params = {}
+    flame_params["rotation"] = torch.tensor(flame_data["rotation"][t]).cuda()
+    flame_params["translation"] = torch.tensor(flame_data["translation"][t]).cuda()
+    flame_params["neck_pose"] = torch.tensor(flame_data["neck_pose"][t]).cuda()
+    flame_params["jaw_pose"] = torch.tensor(flame_data["jaw_pose"][t]).cuda()
+    flame_params["eyes_pose"] = torch.tensor(flame_data["eyes_pose"][t]).cuda()
+    flame_params["expr"] = torch.tensor(flame_data["expr"][t]).cuda()
+    flame_params["shape"] = torch.tensor(flame_data["shape"]).cuda()
+    flame_params["scale"] = torch.tensor(flame_data["scale"]).cuda()
 
-def train(seq, exp):
+    return flame_params
+
+def get_flame_mesh_and_landmarks(flame_head, flame_params):
+    vertices, landmarks = flame_head(
+        flame_params["shape"][None],
+        flame_params["expr"][None],
+        flame_params["rotation"][None],
+        flame_params["neck_pose"][None],
+        flame_params["jaw_pose"][None],
+        flame_params["eyes_pose"][None],
+        flame_params["translation"][None]
+    )
+
+    vertices *= flame_params["scale"]
+    landmarks *= flame_params["scale"]
+
+    return vertices, landmarks
+
+
+def insert_flame_mesh_and_params(flame_vertices, params, variables, optimizer):
+    sq_dist, _ = o3d_knn(flame_vertices.cpu().numpy(), 3)
+    mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+    new_params = {
+        'means3D': flame_vertices,
+        'rgb_colors': torch.zeros_like(flame_vertices).cuda().float(),
+        'seg_colors': torch.zeros_like(flame_vertices).cuda().float(),
+        'unnorm_rotations': torch.tensor(np.tile([1, 0, 0, 0], (len(flame_vertices), 1))).cuda().float(),
+        'logit_opacities': torch.zeros((len(flame_vertices), 1)).cuda().float(),
+        'log_scales': torch.tensor(np.tile(np.log(np.sqrt(mean3_sq_dist))[..., None], (1, 3))).cuda().float(),
+    }
+    new_params["seg_colors"][:, 2] = 1.0
+
+    cat_params_to_optimizer(new_params, params, optimizer)
+    variables["max_2D_radius"] = torch.cat((variables["max_2D_radius"], torch.zeros((len(flame_vertices))).cuda().float()))
+    variables["means2D_gradient_accum"] = torch.cat((variables["means2D_gradient_accum"], torch.zeros((len(flame_vertices))).cuda().float()))
+    variables["denom"] = torch.cat((variables["denom"], torch.zeros((len(flame_vertices))).cuda().float()))
+
+def train(seq, exp, include_flame=True):
     if os.path.exists(f"./output/{exp}/{seq}"):
         print(f"Experiment '{exp}' for sequence '{seq}' already exists. Exiting.")
         return
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
+    flame_data = np.load(f"./data/{seq}/tracked_flame_params.npz")
     num_timesteps = len(md['fn'])
-    params, variables = initialize_params(seq, md)
-    optimizer = initialize_optimizer(params, variables)
+    params, variables = initialize_params(seq, md, False)
+    optimizer = initialize_optimizer(params, variables, False)
+    if include_flame:
+        flame_head = FlameHead(len(flame_data["shape"]), len(flame_data["expr"][0])).cuda()
     output_params = []
+
+    if include_flame:
+        t = 0
+        flame_params_t = get_flame_params(flame_data, t)
+        flame_vertices, _ = get_flame_mesh_and_landmarks(flame_head, flame_params_t)
+        insert_flame_mesh_and_params(flame_vertices[0], params, variables, optimizer)
+
     for t in range(num_timesteps):
         dataset = get_dataset(t, md, seq)
         todo_dataset = []
@@ -220,6 +307,6 @@ def train(seq, exp):
 
 if __name__ == "__main__":
     exp_name = "exp1"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    for sequence in ["Subj1Amb"]:
         train(sequence, exp_name)
         torch.cuda.empty_cache()
